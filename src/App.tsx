@@ -6,28 +6,14 @@
 import { useState, useEffect, useRef, useMemo } from 'react';
 import { GoogleGenAI } from "@google/genai";
 import { CATS, CURR, Transaction, UsersMap } from './types';
-import { auth, db } from './firebase';
+import { auth } from './firebase';
 import { 
   createUserWithEmailAndPassword, 
   signInWithEmailAndPassword, 
   signOut, 
   onAuthStateChanged, 
-  updateProfile,
   User
 } from 'firebase/auth';
-import { 
-  doc, 
-  setDoc, 
-  getDoc, 
-  updateDoc, 
-  collection, 
-  addDoc, 
-  deleteDoc, 
-  onSnapshot, 
-  query, 
-  orderBy,
-  serverTimestamp
-} from 'firebase/firestore';
 
 // Initialize Gemini AI
 const apiKey = process.env.GEMINI_API_KEY;
@@ -82,7 +68,7 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // Data Listener (Firestore)
+  // Load Data from LocalStorage when User Changes
   useEffect(() => {
     if (!curUser) {
       setData([]);
@@ -91,35 +77,38 @@ export default function App() {
       return;
     }
 
-    // Listen to User Doc (Wallet, Goal, Currency)
-    const userRef = doc(db, 'users', curUser.uid);
-    const unsubUser = onSnapshot(userRef, (docSnap) => {
-      if (docSnap.exists()) {
-        const d = docSnap.data();
-        setWallet(d.wallet || 0);
-        setGoal(d.goal || 0);
-        setCurCode(d.curCode || 'PHP');
-      }
-    });
+    const uk = (k: string) => `bct_${curUser.uid}_${k}`;
+    
+    const d = localStorage.getItem(uk('data'));
+    if (d) setData(JSON.parse(d));
+    
+    const w = localStorage.getItem(uk('wallet'));
+    if (w) setWallet(parseFloat(w));
+    
+    const g = localStorage.getItem(uk('goal'));
+    if (g) setGoal(parseFloat(g));
+    
+    const c = localStorage.getItem('bct_cur'); // Global currency preference or per user? Let's keep it global or per user.
+    // Original app used 'bct_cur' globally, let's stick to per-user for consistency with previous turn
+    const uc = localStorage.getItem(uk('cur')); 
+    if (uc) setCurCode(uc);
+    else {
+        const gc = localStorage.getItem('bct_cur');
+        if(gc) setCurCode(gc);
+    }
 
-    // Listen to Transactions Subcollection
-    const q = query(collection(db, 'users', curUser.uid, 'transactions'), orderBy('date', 'desc'), orderBy('createdAt', 'desc'));
-    const unsubTrans = onSnapshot(q, (snapshot) => {
-      const trans: Transaction[] = [];
-      snapshot.forEach((doc) => {
-        trans.push({ id: doc.id, ...doc.data() } as Transaction);
-      });
-      setData(trans);
-    });
-
-    return () => {
-      unsubUser();
-      unsubTrans();
-    };
   }, [curUser]);
 
-  // Save data when it changes - REMOVED (Handled by Firestore listeners)
-  // useEffect(() => { ... }, [data, wallet, goal, curCode, curUser]);
+  // Save Data to LocalStorage
+  useEffect(() => {
+    if (!curUser) return;
+    const uk = (k: string) => `bct_${curUser.uid}_${k}`;
+    localStorage.setItem(uk('data'), JSON.stringify(data));
+    localStorage.setItem(uk('wallet'), wallet.toString());
+    localStorage.setItem(uk('goal'), goal.toString());
+    localStorage.setItem(uk('cur'), curCode);
+    localStorage.setItem('bct_cur', curCode); // Fallback
+  }, [data, wallet, goal, curCode, curUser]);
 
   // ══ HELPERS ══
   const sym = CURR[curCode]?.sym || '₱';
@@ -132,24 +121,12 @@ export default function App() {
 
   // ══ AUTH ══
   const handleAuth = async () => {
-    const { user, pass, name } = authInputs; // user is email here
+    const { user, pass } = authInputs; // user is email here
     if (!user || !pass) return showToast('Please fill all fields');
     
     try {
       if (authMode === 'register') {
-        const userCred = await createUserWithEmailAndPassword(auth, user, pass);
-        await updateProfile(userCred.user, { displayName: name || user.split('@')[0] });
-        
-        // Create initial user doc
-        await setDoc(doc(db, 'users', userCred.user.uid), {
-          name: name || user.split('@')[0],
-          email: user,
-          wallet: 0,
-          goal: 0,
-          curCode: 'PHP',
-          createdAt: serverTimestamp()
-        });
-        
+        await createUserWithEmailAndPassword(auth, user, pass);
         showToast('✅ Account created!');
       } else {
         await signInWithEmailAndPassword(auth, user, pass);
@@ -159,15 +136,14 @@ export default function App() {
     } catch (error: any) {
       console.error(error);
       let msg = 'Authentication failed';
-      if (error.code === 'auth/email-already-in-use') msg = 'Email already in use';
-      if (error.code === 'auth/invalid-email') msg = 'Invalid email address';
-      if (error.code === 'auth/weak-password') msg = 'Password should be at least 6 characters';
-      if (error.code === 'auth/user-not-found' || error.code === 'auth/wrong-password') msg = 'Invalid email or password';
+      if (error.code === 'auth/email-already-in-use') {
+        msg = 'User already exists. Please sign in';
+      } else if (error.code === 'auth/invalid-credential' || error.code === 'auth/user-not-found' || error.code === 'auth/wrong-password' || error.code === 'auth/invalid-email') {
+        msg = 'Email or password is incorrect';
+      }
       showToast('❌ ' + msg);
     }
   };
-
-  // loginUser removed (handled by onAuthStateChanged)
 
   const logout = async () => {
     if (!confirm('Log out?')) return;
@@ -175,77 +151,49 @@ export default function App() {
   };
 
   // ══ TRANSACTIONS ══
-  const addEntry = async () => {
-    if (!curUser) return;
+  const addEntry = () => {
     const { desc, amount, cat, date } = transInputs;
     if (!desc) return showToast('Enter description');
     const amt = parseFloat(amount);
     if (isNaN(amt) || amt <= 0) return showToast('Invalid amount');
     if (!date) return showToast('Select date');
 
-    try {
-      await addDoc(collection(db, 'users', curUser.uid, 'transactions'), {
-        desc,
-        amount: amt,
-        cat,
-        date,
-        type: curType,
-        createdAt: serverTimestamp()
-      });
-      
-      setTransInputs({ ...transInputs, desc: '', amount: '' });
-      showToast(curType === 'expense' ? '📉 Expense added!' : '💰 Saving recorded!');
-    } catch (e) {
-      console.error(e);
-      showToast('Error adding transaction');
-    }
+    const newEntry: Transaction = {
+      id: Date.now(), // Use timestamp for ID since we are back to local storage
+      desc,
+      amount: amt,
+      cat,
+      date,
+      type: curType
+    };
+    
+    setData([newEntry, ...data]);
+    setTransInputs({ ...transInputs, desc: '', amount: '' });
+    showToast(curType === 'expense' ? '📉 Expense added!' : '💰 Saving recorded!');
   };
 
-  const deleteEntry = async (id: string | number) => {
-    if (!curUser) return;
-    try {
-      await deleteDoc(doc(db, 'users', curUser.uid, 'transactions', String(id)));
-    } catch (e) {
-      console.error(e);
-      showToast('Error deleting transaction');
-    }
+  const deleteEntry = (id: string | number) => {
+    setData(data.filter(e => e.id !== id));
   };
 
-  const resetAll = async () => {
-    if (!curUser || !confirm('Reset ALL data? This cannot be undone.')) return;
-    try {
-      // Reset Wallet & Goal
-      await updateDoc(doc(db, 'users', curUser.uid), {
-        wallet: 0,
-        goal: 0
-      });
-      
-      // Delete all transactions
-      // Note: Client-side batch delete is limited, but sufficient here.
-      data.forEach(async (t) => {
-        await deleteDoc(doc(db, 'users', curUser.uid, 'transactions', String(t.id)));
-      });
-      
-      showToast('🔄 All data reset');
-    } catch (e) {
-      console.error(e);
-      showToast('Error resetting data');
-    }
+  const resetAll = () => {
+    if (!confirm('Reset ALL data?')) return;
+    setData([]);
+    setWallet(0);
+    setGoal(0);
+    showToast('🔄 All data reset');
   };
 
-  const updateWallet = async (val: number) => {
-    if (!curUser) return;
-    await updateDoc(doc(db, 'users', curUser.uid), { wallet: val });
+  const updateWallet = (val: number) => {
+    setWallet(val);
   };
 
-  const updateGoal = async (val: number) => {
-    if (!curUser) return;
-    await updateDoc(doc(db, 'users', curUser.uid), { goal: val });
+  const updateGoal = (val: number) => {
+    setGoal(val);
   };
 
-  const updateCurrency = async (code: string) => {
-    if (!curUser) return;
-    await updateDoc(doc(db, 'users', curUser.uid), { curCode: code });
+  const updateCurrency = (code: string) => {
+    setCurCode(code);
   };
 
   // ══ AI ══
